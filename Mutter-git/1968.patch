@@ -1,0 +1,1041 @@
+From 30af007eac021fbc3c301525649c3a2ca428ef56 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Fri, 24 Sep 2021 21:49:45 +0800
+Subject: [PATCH 01/13] onscreen/native: Keep the onscreen alive longer than
+ `MetaDrmBufferGbm`
+
+Because `MetaDrmBufferGbm` uses `gbm_surface` in its destructor and
+`gbm_surface` can't be refcounted directly. So we reference its owner
+(the onscreen) instead.
+
+This avoids a crash that might otherwise occur when hotplugging monitors as
+the old onscreen might get disposed before the new onscreen has presented
+a replacement frame on the same `MetaKmsCrtc`.
+
+We could instead wrap and refcount all users of `gbm_surface`, but that
+would be a lot more work for no additional benefit right now.
+---
+ src/backends/native/meta-onscreen-native.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/backends/native/meta-onscreen-native.c b/src/backends/native/meta-onscreen-native.c
+index 2388a44a282..7c0f883d5b2 100644
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -596,6 +596,16 @@ import_shared_framebuffer (CoglOnscreen                        *onscreen,
+   return imported_buffer;
+ }
+ 
++static void
++reference_owning_gbm_surface (CoglOnscreen     *onscreen,
++                              MetaDrmBufferGbm *buffer_gbm)
++{
++  g_object_set_data_full (G_OBJECT (buffer_gbm),
++                          "gbm_surface owner",
++                          g_object_ref (onscreen),
++                          (GDestroyNotify) g_object_unref);
++}
++
+ static MetaDrmBuffer *
+ copy_shared_framebuffer_gpu (CoglOnscreen                        *onscreen,
+                              MetaOnscreenNativeSecondaryGpuState *secondary_gpu_state,
+@@ -681,6 +691,8 @@ copy_shared_framebuffer_gpu (CoglOnscreen                        *onscreen,
+       return NULL;
+     }
+ 
++  reference_owning_gbm_surface (onscreen, buffer_gbm);
++
+   g_object_set_qdata_full (G_OBJECT (buffer_gbm),
+                            blit_source_quark,
+                            g_object_ref (primary_gpu_fb),
+@@ -1113,6 +1125,7 @@ meta_onscreen_native_swap_buffers_with_damage (CoglOnscreen  *onscreen,
+           return;
+         }
+ 
++      reference_owning_gbm_surface (onscreen, buffer_gbm);
+       primary_gpu_fb = META_DRM_BUFFER (g_steal_pointer (&buffer_gbm));
+       break;
+     case META_RENDERER_NATIVE_MODE_SURFACELESS:
+-- 
+GitLab
+
+
+From 6517fb1332efc81c7e1826d4398edd575f7f5d58 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Mon, 16 Aug 2021 17:06:43 +0800
+Subject: [PATCH 02/13] kms/update: Hold a reference to the buffer used in a
+ plane assignment
+
+---
+ src/backends/native/meta-kms-update.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/backends/native/meta-kms-update.c b/src/backends/native/meta-kms-update.c
+index 5189c5ab324..bb7349ecf53 100644
+--- a/src/backends/native/meta-kms-update.c
++++ b/src/backends/native/meta-kms-update.c
+@@ -190,6 +190,7 @@ static void
+ meta_kms_plane_assignment_free (MetaKmsPlaneAssignment *plane_assignment)
+ {
+   g_clear_pointer (&plane_assignment->fb_damage, meta_kms_fb_damage_free);
++  g_clear_object (&plane_assignment->buffer);
+   g_free (plane_assignment);
+ }
+ 
+@@ -292,7 +293,7 @@ meta_kms_update_assign_plane (MetaKmsUpdate          *update,
+     .update = update,
+     .crtc = crtc,
+     .plane = plane,
+-    .buffer = buffer,
++    .buffer = g_object_ref (buffer),
+     .src_rect = src_rect,
+     .dst_rect = dst_rect,
+     .flags = flags,
+-- 
+GitLab
+
+
+From 0adf87c720d377b4d63305585f0661fda728cdb2 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Mon, 16 Aug 2021 18:04:10 +0800
+Subject: [PATCH 03/13] native: Introduce MetaSwapChain to hold plane buffer
+ references
+
+---
+ src/backends/native/meta-swap-chain.c | 149 ++++++++++++++++++++++++++
+ src/backends/native/meta-swap-chain.h |  48 +++++++++
+ src/meson.build                       |   2 +
+ 3 files changed, 199 insertions(+)
+ create mode 100644 src/backends/native/meta-swap-chain.c
+ create mode 100644 src/backends/native/meta-swap-chain.h
+
+diff --git a/src/backends/native/meta-swap-chain.c b/src/backends/native/meta-swap-chain.c
+new file mode 100644
+index 00000000000..c3bed569d87
+--- /dev/null
++++ b/src/backends/native/meta-swap-chain.c
+@@ -0,0 +1,149 @@
++/*
++ * Copyright (C) 2022 Canonical Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
++ * 02111-1307, USA.
++ *
++ * Author: Daniel van Vugt <daniel.van.vugt@canonical.com>
++ */
++
++#include "backends/native/meta-swap-chain.h"
++
++typedef struct
++{
++  GObject *front, *back;
++  gboolean back_is_set;
++} PlaneState;
++
++typedef struct _MetaSwapChainPrivate MetaSwapChainPrivate;
++struct _MetaSwapChainPrivate
++{
++  GHashTable *plane_states;
++};
++
++G_DEFINE_TYPE_WITH_PRIVATE (MetaSwapChain, meta_swap_chain, G_TYPE_OBJECT)
++
++MetaSwapChain *
++meta_swap_chain_new (void)
++{
++  return g_object_new (META_TYPE_SWAP_CHAIN, NULL);
++}
++
++void
++meta_swap_chain_push_buffer (MetaSwapChain *swap_chain,
++                             unsigned int   plane_id,
++                             GObject       *buffer)
++{
++  MetaSwapChainPrivate *priv =
++    meta_swap_chain_get_instance_private (swap_chain);
++  gpointer key = GUINT_TO_POINTER (plane_id);
++  PlaneState *plane_state;
++
++  plane_state = g_hash_table_lookup (priv->plane_states, key);
++  if (plane_state == NULL)
++    {
++      plane_state = g_new0 (PlaneState, 1);
++      g_hash_table_insert (priv->plane_states, key, plane_state);
++    }
++
++  plane_state->back_is_set = TRUE;  /* note buffer may be NULL */
++  g_set_object (&plane_state->back, buffer);
++}
++
++static void
++swap_plane_buffers (gpointer key,
++                    gpointer value,
++                    gpointer user_data)
++{
++  PlaneState *plane_state = value;
++
++  if (plane_state->back_is_set)
++    {
++      g_set_object (&plane_state->front, plane_state->back);
++      g_clear_object (&plane_state->back);
++      plane_state->back_is_set = FALSE;
++    }
++}
++
++void
++meta_swap_chain_swap_buffers (MetaSwapChain *swap_chain)
++{
++  MetaSwapChainPrivate *priv =
++    meta_swap_chain_get_instance_private (swap_chain);
++
++  g_hash_table_foreach (priv->plane_states, swap_plane_buffers, NULL);
++}
++
++void
++meta_swap_chain_release_buffers (MetaSwapChain *swap_chain)
++{
++  MetaSwapChainPrivate *priv =
++    meta_swap_chain_get_instance_private (swap_chain);
++
++  g_hash_table_remove_all (priv->plane_states);
++}
++
++static void
++meta_swap_chain_dispose (GObject *object)
++{
++  MetaSwapChain *swap_chain = META_SWAP_CHAIN (object);
++
++  meta_swap_chain_release_buffers (swap_chain);
++
++  G_OBJECT_CLASS (meta_swap_chain_parent_class)->dispose (object);
++}
++
++static void
++meta_swap_chain_finalize (GObject *object)
++{
++  MetaSwapChain *swap_chain = META_SWAP_CHAIN (object);
++  MetaSwapChainPrivate *priv =
++    meta_swap_chain_get_instance_private (swap_chain);
++
++  g_hash_table_unref (priv->plane_states);
++
++  G_OBJECT_CLASS (meta_swap_chain_parent_class)->finalize (object);
++}
++
++static void
++destroy_plane_state (gpointer data)
++{
++  PlaneState *plane_state = data;
++
++  g_clear_object (&plane_state->front);
++  g_clear_object (&plane_state->back);
++  g_free (plane_state);
++}
++
++static void
++meta_swap_chain_init (MetaSwapChain *swap_chain)
++{
++  MetaSwapChainPrivate *priv =
++    meta_swap_chain_get_instance_private (swap_chain);
++
++  priv->plane_states = g_hash_table_new_full (NULL,
++                                              NULL,
++                                              NULL,
++                                              destroy_plane_state);
++}
++
++static void
++meta_swap_chain_class_init (MetaSwapChainClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++  object_class->dispose = meta_swap_chain_dispose;
++  object_class->finalize = meta_swap_chain_finalize;
++}
+diff --git a/src/backends/native/meta-swap-chain.h b/src/backends/native/meta-swap-chain.h
+new file mode 100644
+index 00000000000..bad772b8929
+--- /dev/null
++++ b/src/backends/native/meta-swap-chain.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 2022 Canonical Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
++ * 02111-1307, USA.
++ *
++ * Author: Daniel van Vugt <daniel.van.vugt@canonical.com>
++ */
++
++#ifndef META_SWAP_CHAIN_H
++#define META_SWAP_CHAIN_H
++
++#include <glib-object.h>
++
++#define META_TYPE_SWAP_CHAIN (meta_swap_chain_get_type ())
++G_DECLARE_DERIVABLE_TYPE (MetaSwapChain,
++                          meta_swap_chain,
++                          META, SWAP_CHAIN,
++                          GObject)
++
++struct _MetaSwapChainClass
++{
++  GObjectClass parent_class;
++};
++
++MetaSwapChain * meta_swap_chain_new (void);
++
++void meta_swap_chain_push_buffer (MetaSwapChain *swap_chain,
++                                  unsigned int   plane_id,
++                                  GObject       *buffer);
++
++void meta_swap_chain_swap_buffers (MetaSwapChain *swap_chain);
++
++void meta_swap_chain_release_buffers (MetaSwapChain *swap_chain);
++
++#endif /* META_SWAP_CHAIN_H */
+diff --git a/src/meson.build b/src/meson.build
+index 535568a594d..de991f69585 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -851,6 +851,8 @@ if have_native_backend
+     'backends/native/meta-seat-native.h',
+     'backends/native/meta-stage-native.c',
+     'backends/native/meta-stage-native.h',
++    'backends/native/meta-swap-chain.c',
++    'backends/native/meta-swap-chain.h',
+     'backends/native/meta-thread-impl.c',
+     'backends/native/meta-thread-impl.h',
+     'backends/native/meta-thread-private.h',
+-- 
+GitLab
+
+
+From b948e60ccffc3b48db0349512c27bc849fdb76da Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Wed, 18 Jan 2023 18:42:01 +0800
+Subject: [PATCH 04/13] kms/crtc: Add a local swap chain
+
+---
+ src/backends/native/meta-kms-crtc.c | 21 +++++++++++++++++++++
+ src/backends/native/meta-kms-crtc.h |  3 +++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/src/backends/native/meta-kms-crtc.c b/src/backends/native/meta-kms-crtc.c
+index d89b1259895..b17e8460d6d 100644
+--- a/src/backends/native/meta-kms-crtc.c
++++ b/src/backends/native/meta-kms-crtc.c
+@@ -48,6 +48,8 @@ struct _MetaKmsCrtc
+   MetaKmsCrtcState current_state;
+ 
+   MetaKmsCrtcPropTable prop_table;
++
++  MetaSwapChain *swap_chain;
+ };
+ 
+ G_DEFINE_TYPE (MetaKmsCrtc, meta_kms_crtc, G_TYPE_OBJECT)
+@@ -99,6 +101,12 @@ meta_kms_crtc_get_prop_drm_value (MetaKmsCrtc     *crtc,
+   return meta_kms_prop_convert_value (prop, value);
+ }
+ 
++MetaSwapChain *
++meta_kms_crtc_get_swap_chain (MetaKmsCrtc *crtc)
++{
++  return crtc->swap_chain;
++}
++
+ gboolean
+ meta_kms_crtc_is_active (MetaKmsCrtc *crtc)
+ {
+@@ -465,12 +473,23 @@ meta_kms_crtc_new (MetaKmsImplDevice  *impl_device,
+   return crtc;
+ }
+ 
++static void
++meta_kms_crtc_dispose (GObject *object)
++{
++  MetaKmsCrtc *crtc = META_KMS_CRTC (object);
++
++  meta_swap_chain_release_buffers (crtc->swap_chain);
++
++  G_OBJECT_CLASS (meta_kms_crtc_parent_class)->dispose (object);
++}
++
+ static void
+ meta_kms_crtc_finalize (GObject *object)
+ {
+   MetaKmsCrtc *crtc = META_KMS_CRTC (object);
+ 
+   g_clear_pointer (&crtc->current_state.gamma.value, meta_gamma_lut_free);
++  g_clear_object (&crtc->swap_chain);
+ 
+   G_OBJECT_CLASS (meta_kms_crtc_parent_class)->finalize (object);
+ }
+@@ -480,6 +499,7 @@ meta_kms_crtc_init (MetaKmsCrtc *crtc)
+ {
+   crtc->current_state.gamma.size = 0;
+   crtc->current_state.gamma.value = NULL;
++  crtc->swap_chain = meta_swap_chain_new ();
+ }
+ 
+ static void
+@@ -487,6 +507,7 @@ meta_kms_crtc_class_init (MetaKmsCrtcClass *klass)
+ {
+   GObjectClass *object_class = G_OBJECT_CLASS (klass);
+ 
++  object_class->dispose = meta_kms_crtc_dispose;
+   object_class->finalize = meta_kms_crtc_finalize;
+ }
+ 
+diff --git a/src/backends/native/meta-kms-crtc.h b/src/backends/native/meta-kms-crtc.h
+index b26b682ddbb..a30a6de6e78 100644
+--- a/src/backends/native/meta-kms-crtc.h
++++ b/src/backends/native/meta-kms-crtc.h
+@@ -22,6 +22,7 @@
+ #include <xf86drmMode.h>
+ 
+ #include "backends/native/meta-kms-types.h"
++#include "backends/native/meta-swap-chain.h"
+ #include "backends/meta-backend-types.h"
+ #include "core/util-private.h"
+ #include "meta/boxes.h"
+@@ -60,3 +61,5 @@ int meta_kms_crtc_get_idx (MetaKmsCrtc *crtc);
+ 
+ META_EXPORT_TEST
+ gboolean meta_kms_crtc_is_active (MetaKmsCrtc *crtc);
++
++MetaSwapChain * meta_kms_crtc_get_swap_chain (MetaKmsCrtc *crtc);
+-- 
+GitLab
+
+
+From d831fdd0463acfc10ab7bbd7979e245caec5e4a1 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Tue, 17 Aug 2021 16:35:18 +0800
+Subject: [PATCH 05/13] onscreen/native: Pump the CRTC's buffer reference queue
+ on scanout
+
+Precise timing of this call is not important. We only need to notify
+that the *previous* scanout is definitely no longer happening. So any
+old buffers no longer used in the latest scanout can be released.
+---
+ src/backends/native/meta-onscreen-native.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/backends/native/meta-onscreen-native.c b/src/backends/native/meta-onscreen-native.c
+index 7c0f883d5b2..e95d01a1ea1 100644
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -229,6 +229,7 @@ notify_view_crtc_presented (MetaRendererView *view,
+ 
+   meta_onscreen_native_notify_frame_complete (onscreen);
+   meta_onscreen_native_swap_drm_fb (onscreen);
++  meta_swap_chain_swap_buffers (meta_kms_crtc_get_swap_chain (kms_crtc));
+ }
+ 
+ static void
+-- 
+GitLab
+
+
+From 1c6e82b36343963e2384af362f197cbfe5fa4139 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Wed, 9 Feb 2022 16:44:09 +0800
+Subject: [PATCH 06/13] kms/impl-device: Release buffers from MetaKmsCrtc in
+ prepare_shutdown
+
+This allows them to release their buffers cleanly while all the
+associated resources to do the release still exist. Otherwise we
+might crash later in meta_drm_buffer_finalize.
+---
+ src/backends/native/meta-kms-impl-device.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/backends/native/meta-kms-impl-device.c b/src/backends/native/meta-kms-impl-device.c
+index bce64d309d4..8b82cd0ec07 100644
+--- a/src/backends/native/meta-kms-impl-device.c
++++ b/src/backends/native/meta-kms-impl-device.c
+@@ -1862,6 +1862,16 @@ meta_kms_impl_device_init_mode_setting (MetaKmsImplDevice  *impl_device,
+   return TRUE;
+ }
+ 
++static void
++release_buffers (gpointer data,
++                 gpointer user_data)
++{
++  MetaKmsCrtc *crtc = data;
++  MetaSwapChain *swap_chain = meta_kms_crtc_get_swap_chain (crtc);
++
++  meta_swap_chain_release_buffers (swap_chain);
++}
++
+ void
+ meta_kms_impl_device_prepare_shutdown (MetaKmsImplDevice *impl_device)
+ {
+@@ -1869,6 +1879,8 @@ meta_kms_impl_device_prepare_shutdown (MetaKmsImplDevice *impl_device)
+     meta_kms_impl_device_get_instance_private (impl_device);
+   MetaKmsImplDeviceClass *klass = META_KMS_IMPL_DEVICE_GET_CLASS (impl_device);
+ 
++  g_list_foreach (priv->crtcs, release_buffers, NULL);
++
+   if (klass->prepare_shutdown)
+     klass->prepare_shutdown (impl_device);
+ 
+-- 
+GitLab
+
+
+From c0207903a0e34a8e4ac6147c89b290885ebf3b27 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Tue, 7 Dec 2021 18:31:16 +0800
+Subject: [PATCH 07/13] kms/impl-device/simple: Pump the CRTC's buffer
+ reference queue on scanout
+
+In this case "on scanout" means when `drmModeSetCrtc` succeeds. This is
+the only case where there won't be a `meta_kms_page_flip_data_flipped` to
+do it for us.
+---
+ src/backends/native/meta-kms-impl-device-simple.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/backends/native/meta-kms-impl-device-simple.c b/src/backends/native/meta-kms-impl-device-simple.c
+index 2d68ba11f67..7196837f9c5 100644
+--- a/src/backends/native/meta-kms-impl-device-simple.c
++++ b/src/backends/native/meta-kms-impl-device-simple.c
+@@ -485,6 +485,8 @@ process_mode_set (MetaKmsImplDevice  *impl_device,
+       return FALSE;
+     }
+ 
++  meta_swap_chain_swap_buffers (meta_kms_crtc_get_swap_chain (crtc));
++
+   if (drm_mode)
+     {
+       g_hash_table_replace (impl_device_simple->cached_mode_sets,
+@@ -877,6 +879,8 @@ mode_set_fallback (MetaKmsImplDeviceSimple  *impl_device_simple,
+       return FALSE;
+     }
+ 
++  meta_swap_chain_swap_buffers (meta_kms_crtc_get_swap_chain (crtc));
++
+   if (!impl_device_simple->mode_set_fallback_feedback_source)
+     {
+       MetaKmsImpl *impl = meta_kms_impl_device_get_impl (impl_device);
+-- 
+GitLab
+
+
+From 9e383decca6d65f9389c6e99ad09bd96e72e1f54 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Tue, 17 Aug 2021 17:40:57 +0800
+Subject: [PATCH 08/13] kms/impl-device/simple: Keep a reference to buffers
+ assigned to planes
+
+The MetaKmsCrtc will hold these references during future scanouts until
+such time as a new buffer is assigned to the plane AND another scanout
+has occurred after that.
+---
+ src/backends/native/meta-kms-impl-device-simple.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/backends/native/meta-kms-impl-device-simple.c b/src/backends/native/meta-kms-impl-device-simple.c
+index 7196837f9c5..26660e5f480 100644
+--- a/src/backends/native/meta-kms-impl-device-simple.c
++++ b/src/backends/native/meta-kms-impl-device-simple.c
+@@ -1303,7 +1303,7 @@ process_plane_assignment (MetaKmsImplDevice       *impl_device,
+     {
+     case META_KMS_PLANE_TYPE_PRIMARY:
+       /* Handled as part of the mode-set and page flip. */
+-      return TRUE;
++      goto assigned;
+     case META_KMS_PLANE_TYPE_CURSOR:
+       if (!process_cursor_plane_assignment (impl_device, update,
+                                             plane_assignment,
+@@ -1317,7 +1317,7 @@ process_plane_assignment (MetaKmsImplDevice       *impl_device,
+         }
+       else
+         {
+-          return TRUE;
++          goto assigned;
+         }
+     case META_KMS_PLANE_TYPE_OVERLAY:
+       error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_FAILED,
+@@ -1330,6 +1330,12 @@ process_plane_assignment (MetaKmsImplDevice       *impl_device,
+     }
+ 
+   g_assert_not_reached ();
++
++assigned:
++  meta_swap_chain_push_buffer (meta_kms_crtc_get_swap_chain (plane_assignment->crtc),
++                               meta_kms_plane_get_id (plane),
++                               G_OBJECT (plane_assignment->buffer));
++  return TRUE;
+ }
+ 
+ static gboolean
+-- 
+GitLab
+
+
+From aae72cde177345b88f7b9e1ecd8bad89624b07c6 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Tue, 7 Dec 2021 17:54:15 +0800
+Subject: [PATCH 09/13] kms/impl-device/simple: Keep a reference to buffers
+ needed in retries
+
+---
+ .../native/meta-kms-impl-device-simple.c      | 24 ++++++++++++-------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/src/backends/native/meta-kms-impl-device-simple.c b/src/backends/native/meta-kms-impl-device-simple.c
+index 26660e5f480..f4e23df0748 100644
+--- a/src/backends/native/meta-kms-impl-device-simple.c
++++ b/src/backends/native/meta-kms-impl-device-simple.c
+@@ -556,7 +556,7 @@ is_timestamp_earlier_than (uint64_t ts1,
+ typedef struct _RetryPageFlipData
+ {
+   MetaKmsCrtc *crtc;
+-  uint32_t fb_id;
++  MetaDrmBuffer *fb;
+   MetaKmsPageFlipData *page_flip_data;
+   float refresh_rate;
+   uint64_t retry_time_us;
+@@ -569,6 +569,7 @@ retry_page_flip_data_free (RetryPageFlipData *retry_page_flip_data)
+   g_assert (!retry_page_flip_data->page_flip_data);
+   g_clear_pointer (&retry_page_flip_data->custom_page_flip,
+                    meta_kms_custom_page_flip_free);
++  g_clear_object (&retry_page_flip_data->fb);
+   g_free (retry_page_flip_data);
+ }
+ 
+@@ -636,16 +637,21 @@ retry_page_flips (gpointer user_data)
+         }
+       else
+         {
++          uint32_t fb_id =
++            retry_page_flip_data->fb ?
++            meta_drm_buffer_get_fb_id (retry_page_flip_data->fb) :
++            0;
++
+           meta_topic (META_DEBUG_KMS,
+                       "[simple] Retrying page flip on CRTC %u (%s) with %u",
+                       meta_kms_crtc_get_id (crtc),
+                       meta_kms_impl_device_get_path (impl_device),
+-                      retry_page_flip_data->fb_id);
++                      fb_id);
+ 
+           fd = meta_kms_impl_device_get_fd (impl_device);
+           ret = drmModePageFlip (fd,
+                                  meta_kms_crtc_get_id (crtc),
+-                                 retry_page_flip_data->fb_id,
++                                 fb_id,
+                                  DRM_MODE_PAGE_FLIP_EVENT,
+                                  retry_page_flip_data->page_flip_data);
+         }
+@@ -732,7 +738,7 @@ retry_page_flips (gpointer user_data)
+ static void
+ schedule_retry_page_flip (MetaKmsImplDeviceSimple *impl_device_simple,
+                           MetaKmsCrtc             *crtc,
+-                          uint32_t                 fb_id,
++                          MetaDrmBuffer           *fb,
+                           float                    refresh_rate,
+                           MetaKmsPageFlipData     *page_flip_data,
+                           MetaKmsCustomPageFlip   *custom_page_flip)
+@@ -747,7 +753,7 @@ schedule_retry_page_flip (MetaKmsImplDeviceSimple *impl_device_simple,
+   retry_page_flip_data = g_new0 (RetryPageFlipData, 1);
+   *retry_page_flip_data = (RetryPageFlipData) {
+     .crtc = crtc,
+-    .fb_id = fb_id,
++    .fb = fb ? g_object_ref (fb) : NULL,
+     .page_flip_data = page_flip_data,
+     .refresh_rate = refresh_rate,
+     .retry_time_us = retry_time_us,
+@@ -1007,20 +1013,20 @@ dispatch_page_flip (MetaKmsImplDevice    *impl_device,
+       cached_mode_set = get_cached_mode_set (impl_device_simple, crtc);
+       if (cached_mode_set)
+         {
+-          uint32_t fb_id;
++          MetaDrmBuffer *fb;
+           drmModeModeInfo *drm_mode;
+           float refresh_rate;
+ 
+           if (plane_assignment)
+-            fb_id = meta_drm_buffer_get_fb_id (plane_assignment->buffer);
++            fb = plane_assignment->buffer;
+           else
+-            fb_id = 0;
++            fb = NULL;
+           drm_mode = cached_mode_set->drm_mode;
+           refresh_rate = meta_calculate_drm_mode_refresh_rate (drm_mode);
+           meta_kms_impl_device_hold_fd (impl_device);
+           schedule_retry_page_flip (impl_device_simple,
+                                     crtc,
+-                                    fb_id,
++                                    fb,
+                                     refresh_rate,
+                                     page_flip_data,
+                                     g_steal_pointer (&custom_page_flip));
+-- 
+GitLab
+
+
+From 9d69867fbce7561220d6f1c5e7c27682f672e0cd Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Tue, 17 Aug 2021 16:36:25 +0800
+Subject: [PATCH 10/13] kms/impl-device/atomic: Keep a reference to buffers
+ assigned to planes
+
+The MetaKmsCrtc will hold these references during future scanouts until
+such time as a new buffer is assigned to the plane AND another scanout
+has occurred after that.
+---
+ src/backends/native/meta-kms-impl-device-atomic.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/backends/native/meta-kms-impl-device-atomic.c b/src/backends/native/meta-kms-impl-device-atomic.c
+index 2ca70326fa6..80c01413c22 100644
+--- a/src/backends/native/meta-kms-impl-device-atomic.c
++++ b/src/backends/native/meta-kms-impl-device-atomic.c
+@@ -505,6 +505,7 @@ process_plane_assignment (MetaKmsImplDevice  *impl_device,
+ {
+   MetaKmsPlaneAssignment *plane_assignment = update_entry;
+   MetaKmsPlane *plane = plane_assignment->plane;
++  MetaKmsUpdateFlag flags = (MetaKmsUpdateFlag) user_data;
+   MetaDrmBuffer *buffer;
+   MetaKmsFbDamage *fb_damage;
+   uint32_t prop_id;
+@@ -657,6 +658,12 @@ process_plane_assignment (MetaKmsImplDevice  *impl_device,
+                                error))
+         return FALSE;
+     }
++
++  if (!(flags & META_KMS_UPDATE_FLAG_TEST_ONLY))
++    meta_swap_chain_push_buffer (meta_kms_crtc_get_swap_chain (plane_assignment->crtc),
++                                 meta_kms_plane_get_id (plane),
++                                 G_OBJECT (buffer));
++
+   return TRUE;
+ }
+ 
+@@ -1005,7 +1012,7 @@ meta_kms_impl_device_atomic_process_update (MetaKmsImplDevice *impl_device,
+                         req,
+                         blob_ids,
+                         meta_kms_update_get_plane_assignments (update),
+-                        NULL,
++                        GUINT_TO_POINTER (flags),
+                         process_plane_assignment,
+                         &error))
+     goto err;
+-- 
+GitLab
+
+
+From 22e9d9ca7189b2479819b80fbec1877ea732e058 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Wed, 18 Aug 2021 15:04:27 +0800
+Subject: [PATCH 11/13] onscreen/native: Stop holding the current onscreen
+ buffer
+
+The scanout lifetime of the buffer is now automatically managed via
+meta_crtc_kms_assign_primary_plane. Se we don't need `current_fb` at
+all, and `next_fb` can be unreferenced as soon as we've passed it to
+meta_crtc_kms_assign_primary_plane.
+---
+ src/backends/native/meta-onscreen-native.c | 43 ++--------------------
+ 1 file changed, 4 insertions(+), 39 deletions(-)
+
+diff --git a/src/backends/native/meta-onscreen-native.c b/src/backends/native/meta-onscreen-native.c
+index e95d01a1ea1..636dff13112 100644
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -93,7 +93,6 @@ struct _MetaOnscreenNative
+ 
+   struct {
+     struct gbm_surface *surface;
+-    MetaDrmBuffer *current_fb;
+     MetaDrmBuffer *next_fb;
+   } gbm;
+ 
+@@ -128,36 +127,6 @@ init_secondary_gpu_state (MetaRendererNative  *renderer_native,
+                           CoglOnscreen        *onscreen,
+                           GError             **error);
+ 
+-static void
+-free_current_bo (CoglOnscreen *onscreen)
+-{
+-  MetaOnscreenNative *onscreen_native = META_ONSCREEN_NATIVE (onscreen);
+-
+-  g_clear_object (&onscreen_native->gbm.current_fb);
+-}
+-
+-static void
+-meta_onscreen_native_swap_drm_fb (CoglOnscreen *onscreen)
+-{
+-  MetaOnscreenNative *onscreen_native = META_ONSCREEN_NATIVE (onscreen);
+-
+-  if (!onscreen_native->gbm.next_fb)
+-    return;
+-
+-  free_current_bo (onscreen);
+-
+-  g_set_object (&onscreen_native->gbm.current_fb, onscreen_native->gbm.next_fb);
+-  g_clear_object (&onscreen_native->gbm.next_fb);
+-}
+-
+-static void
+-meta_onscreen_native_clear_next_fb (CoglOnscreen *onscreen)
+-{
+-  MetaOnscreenNative *onscreen_native = META_ONSCREEN_NATIVE (onscreen);
+-
+-  g_clear_object (&onscreen_native->gbm.next_fb);
+-}
+-
+ static void
+ maybe_update_frame_info (MetaCrtc         *crtc,
+                          CoglFrameInfo    *frame_info,
+@@ -228,7 +197,6 @@ notify_view_crtc_presented (MetaRendererView *view,
+   maybe_update_frame_info (crtc, frame_info, time_us, flags, sequence);
+ 
+   meta_onscreen_native_notify_frame_complete (onscreen);
+-  meta_onscreen_native_swap_drm_fb (onscreen);
+   meta_swap_chain_swap_buffers (meta_kms_crtc_get_swap_chain (kms_crtc));
+ }
+ 
+@@ -337,7 +305,6 @@ page_flip_feedback_discarded (MetaKmsCrtc  *kms_crtc,
+   frame_info->flags |= COGL_FRAME_INFO_FLAG_SYMBOLIC;
+ 
+   meta_onscreen_native_notify_frame_complete (onscreen);
+-  meta_onscreen_native_clear_next_fb (onscreen);
+ }
+ 
+ static const MetaKmsPageFlipListenerVtable page_flip_listener_vtable = {
+@@ -402,8 +369,9 @@ void
+ meta_onscreen_native_dummy_power_save_page_flip (CoglOnscreen *onscreen)
+ {
+   CoglFrameInfo *frame_info;
++  MetaOnscreenNative *onscreen_native = META_ONSCREEN_NATIVE (onscreen);
+ 
+-  meta_onscreen_native_swap_drm_fb (onscreen);
++  g_clear_object (&onscreen_native->gbm.next_fb);
+ 
+   frame_info = cogl_onscreen_peek_tail_frame_info (onscreen);
+   frame_info->flags |= COGL_FRAME_INFO_FLAG_SYMBOLIC;
+@@ -426,7 +394,7 @@ meta_onscreen_native_flip_crtc (CoglOnscreen                *onscreen,
+   MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
+   MetaRendererNativeGpuData *renderer_gpu_data;
+   MetaGpuKms *gpu_kms;
+-  MetaDrmBuffer *buffer;
++  g_autoptr (MetaDrmBuffer) buffer = NULL;
+   MetaKmsPlaneAssignment *plane_assignment;
+ 
+   COGL_TRACE_BEGIN_SCOPED (MetaOnscreenNativeFlipCrtcs,
+@@ -441,7 +409,7 @@ meta_onscreen_native_flip_crtc (CoglOnscreen                *onscreen,
+   switch (renderer_gpu_data->mode)
+     {
+     case META_RENDERER_NATIVE_MODE_GBM:
+-      buffer = onscreen_native->gbm.next_fb;
++      buffer = g_steal_pointer (&onscreen_native->gbm.next_fb);
+ 
+       plane_assignment = meta_crtc_kms_assign_primary_plane (crtc_kms,
+                                                              buffer,
+@@ -1045,7 +1013,6 @@ swap_buffer_result_feedback (const MetaKmsFeedback *kms_feedback,
+   frame_info->flags |= COGL_FRAME_INFO_FLAG_SYMBOLIC;
+ 
+   meta_onscreen_native_notify_frame_complete (onscreen);
+-  meta_onscreen_native_clear_next_fb (onscreen);
+ }
+ 
+ static const MetaKmsResultListenerVtable swap_buffer_result_listener_vtable = {
+@@ -1333,7 +1300,6 @@ scanout_result_feedback (const MetaKmsFeedback *kms_feedback,
+   frame_info->flags |= COGL_FRAME_INFO_FLAG_SYMBOLIC;
+ 
+   meta_onscreen_native_notify_frame_complete (onscreen);
+-  meta_onscreen_native_clear_next_fb (onscreen);
+ }
+ 
+ static const MetaKmsResultListenerVtable scanout_result_listener_vtable = {
+@@ -2435,7 +2401,6 @@ meta_onscreen_native_dispose (GObject *object)
+     {
+     case META_RENDERER_NATIVE_MODE_GBM:
+       g_clear_object (&onscreen_native->gbm.next_fb);
+-      free_current_bo (onscreen);
+       break;
+     case META_RENDERER_NATIVE_MODE_SURFACELESS:
+       g_assert_not_reached ();
+-- 
+GitLab
+
+
+From bb82873e0a9de2b77b352c37dd1e423e742520f7 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Thu, 2 Mar 2023 18:01:26 +0800
+Subject: [PATCH 12/13] FIXME: Temporary workaround for the scanout-failed
+ signal
+
+---
+ src/backends/native/meta-onscreen-native.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/backends/native/meta-onscreen-native.c b/src/backends/native/meta-onscreen-native.c
+index 636dff13112..74a5fcec1b0 100644
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -94,6 +94,11 @@ struct _MetaOnscreenNative
+   struct {
+     struct gbm_surface *surface;
+     MetaDrmBuffer *next_fb;
++
++    /* Temporary workaround for the scanout-failed signal wanting the buffer
++     * to live longer than it does, and then it doesn't use it anyway...
++     */
++    MetaDrmBuffer *direct_fb;
+   } gbm;
+ 
+ #ifdef HAVE_EGL_DEVICE
+@@ -1277,6 +1282,7 @@ scanout_result_feedback (const MetaKmsFeedback *kms_feedback,
+   CoglOnscreen *onscreen = COGL_ONSCREEN (onscreen_native);
+   const GError *error;
+   CoglFrameInfo *frame_info;
++  g_autoptr (MetaDrmBuffer) direct_fb = g_steal_pointer (&onscreen_native->gbm.direct_fb);
+ 
+   error = meta_kms_feedback_get_error (kms_feedback);
+   if (!error)
+@@ -1290,8 +1296,7 @@ scanout_result_feedback (const MetaKmsFeedback *kms_feedback,
+ 
+       g_warning ("Direct scanout page flip failed: %s", error->message);
+ 
+-      cogl_scanout_notify_failed (COGL_SCANOUT (onscreen_native->gbm.next_fb),
+-                                  onscreen);
++      cogl_scanout_notify_failed (COGL_SCANOUT (direct_fb), onscreen);
+       clutter_stage_view_add_redraw_clip (view, NULL);
+       clutter_stage_view_schedule_update_now (view);
+     }
+@@ -1365,6 +1370,8 @@ meta_onscreen_native_direct_scanout (CoglOnscreen   *onscreen,
+   kms_device = meta_kms_crtc_get_device (kms_crtc);
+   kms_update = meta_frame_native_ensure_kms_update (frame_native, kms_device);
+ 
++  g_set_object (&onscreen_native->gbm.direct_fb,
++                onscreen_native->gbm.next_fb);
+   meta_kms_update_add_result_listener (kms_update,
+                                        &scanout_result_listener_vtable,
+                                        NULL,
+@@ -2401,6 +2408,7 @@ meta_onscreen_native_dispose (GObject *object)
+     {
+     case META_RENDERER_NATIVE_MODE_GBM:
+       g_clear_object (&onscreen_native->gbm.next_fb);
++      g_clear_object (&onscreen_native->gbm.direct_fb);
+       break;
+     case META_RENDERER_NATIVE_MODE_SURFACELESS:
+       g_assert_not_reached ();
+-- 
+GitLab
+
+
+From 6d93c751788047b28af7a7c84889b70fb27fbd44 Mon Sep 17 00:00:00 2001
+From: Daniel van Vugt <daniel.van.vugt@canonical.com>
+Date: Fri, 15 Sep 2023 18:24:22 +0800
+Subject: [PATCH 13/13] renderer/native: Release buffers from disabled CRTCs on
+ hotplug
+
+CRTCs tend to live for the lifetime of the device, but they also
+(currently) own the swap chains. So when a monitor is unplugged we
+need to tell the CRTC when it's safe to clear its swap chain and release
+all buffers. This only happens after the mode set to disable the CRTC
+has completed.
+
+Without this change, CRTCs that had been used in the past would keep
+their swap chains populated even after the monitor was unplugged and the
+CRTC disabled. This led to a leak of the old onscreen too, because of:
+
+onscreen/native: Keep the onscreen alive longer than `MetaDrmBufferGbm`
+---
+ src/backends/native/meta-renderer-native.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index e6c653e269b..a62249bb528 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -99,6 +99,7 @@ struct _MetaRendererNative
+ 
+   GList *detached_onscreens;
+   GList *lingering_onscreens;
++  GList *disabled_crtcs;
+   guint release_unused_gpus_idle_id;
+ 
+   GList *power_save_page_flip_onscreens;
+@@ -683,6 +684,9 @@ configure_disabled_crtcs (MetaKmsDevice      *kms_device,
+ 
+       kms_update = ensure_mode_set_update (renderer_native, kms_device);
+       meta_kms_update_mode_set (kms_update, kms_crtc, NULL, NULL);
++
++      renderer_native->disabled_crtcs =
++        g_list_prepend (renderer_native->disabled_crtcs, kms_crtc);
+     }
+ }
+ 
+@@ -817,6 +821,22 @@ clear_detached_onscreens (MetaRendererNative *renderer_native)
+                 g_object_unref);
+ }
+ 
++static void
++clear_disabled_crtcs (MetaRendererNative *renderer_native)
++{
++  GList *l;
++
++  for (l = renderer_native->disabled_crtcs; l; l = l->next)
++    {
++      MetaKmsCrtc *kms_crtc = l->data;
++      MetaSwapChain *swap_chain = meta_kms_crtc_get_swap_chain (kms_crtc);
++
++      meta_swap_chain_release_buffers (swap_chain);
++    }
++
++  g_clear_list (&renderer_native->disabled_crtcs, NULL);
++}
++
+ static void
+ mode_sets_update_result_feedback (const MetaKmsFeedback *kms_feedback,
+                                   gpointer               user_data)
+@@ -878,6 +898,7 @@ meta_renderer_native_post_mode_set_updates (MetaRendererNative *renderer_native)
+   post_mode_set_updates (renderer_native);
+ 
+   clear_detached_onscreens (renderer_native);
++  clear_disabled_crtcs (renderer_native);
+ 
+   meta_kms_notify_modes_set (kms);
+ 
+@@ -2239,6 +2260,7 @@ meta_renderer_native_finalize (GObject *object)
+   g_clear_handle_id (&renderer_native->release_unused_gpus_idle_id,
+                      g_source_remove);
+   clear_detached_onscreens (renderer_native);
++  clear_disabled_crtcs (renderer_native);
+ 
+   g_hash_table_destroy (renderer_native->gpu_datas);
+   g_clear_object (&renderer_native->gles3);
+-- 
+GitLab
+
