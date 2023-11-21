@@ -21,3 +21,5 @@ Draft: KMS: Unify buffer management for all plane types https://gitlab.gnome.org
 Nvidia secondary GPU copy acceleration https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/3304
 
 VRR Patch https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/1154
+
+Also thanks to ptr1337 who made some of the packages!
