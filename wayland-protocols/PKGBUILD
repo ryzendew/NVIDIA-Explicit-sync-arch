@@ -13,7 +13,8 @@ validpgpkeys=('8307C0A224BABDA1BABD0EB9A6EEEC9E0136164A'  # Jonas Ådahl
 source=("https://gitlab.freedesktop.org/wayland/$pkgname/-/releases/$pkgver/downloads/$pkgname-$pkgver.tar.xz"{,.sig}
 		90.patch)
 sha256sums=('7459799d340c8296b695ef857c07ddef24c5a09b09ab6a74f7b92640d2b1ba11'
-            'SKIP')
+            'SKIP'
+            '923687e652bd56fd90345cb1886652220df919b0728925bff986d74db8d878c6')
 
 prepare() {
   cd $pkgname-$pkgver
